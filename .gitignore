@@ -101,3 +101,10 @@ backups/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Local tooling / logs
+.claude/worktrees/
+.claude/settings.local.json
+app_logs.txt
+temp.err
+temp.log

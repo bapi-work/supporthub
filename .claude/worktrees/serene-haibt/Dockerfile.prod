@@ -1,0 +1,76 @@
+# Production Dockerfile for SupportHub
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Install security updates
+RUN apk update && apk upgrade && apk add --no-cache git
+
+# Copy package files first for better layer caching
+COPY package.json package-lock.json ./
+# Install all dependencies (including dev dependencies for build)
+# Force remove lockfile to ensure clean install 
+RUN rm -f package-lock.json && npm install && npm install -D @rollup/rollup-linux-x64-musl
+
+# Copy all source code and config files
+COPY . .
+
+# Build the client (frontend)
+RUN npx vite build
+
+# Build the server (backend) using production entry point (no vite imports)
+RUN npx esbuild server/index.prod.ts --platform=node --packages=external --bundle --format=esm --outfile=dist/index.js
+
+# Production stage
+FROM node:20-alpine AS production
+
+# Install security updates and required packages
+RUN apk update && apk upgrade && \
+    apk add --no-cache curl dumb-init && \
+    rm -rf /var/cache/apk/*
+
+# Create app user for security
+RUN addgroup -g 1001 nodejs && \
+    adduser -u 1001 -G nodejs -h /home/supporthub -s /bin/sh -D supporthub
+
+WORKDIR /app
+
+# Copy package files
+COPY package.json package-lock.json ./
+
+# Install only production dependencies
+RUN npm install --only=production && \
+    npm cache clean --force
+
+# Copy built application from builder stage
+COPY --from=builder --chown=supporthub:nodejs /app/dist ./dist
+
+# Copy shared schema
+COPY --from=builder --chown=supporthub:nodejs /app/shared ./shared
+
+# Copy only necessary server files (not vite.ts which requires vite package)
+COPY --from=builder --chown=supporthub:nodejs /app/server/static.ts ./server/
+COPY --from=builder --chown=supporthub:nodejs /app/server/logger.ts ./server/
+
+# Copy drizzle config
+COPY --from=builder --chown=supporthub:nodejs /app/drizzle.config.ts ./
+
+# Create necessary directories
+RUN mkdir -p uploads logs && \
+    chown -R supporthub:nodejs uploads logs
+
+# Set proper permissions
+USER supporthub
+
+# Expose port
+EXPOSE 5000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:5000/api/health || exit 1
+
+# Use dumb-init to handle signals properly
+ENTRYPOINT ["dumb-init", "--"]
+
+# Start the application
+CMD ["node", "dist/index.js"]

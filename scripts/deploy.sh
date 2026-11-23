@@ -50,7 +50,11 @@ fi
 echo -e "${GREEN}Deploying with Docker Compose...${NC}"
 
 # Rebuild app and nginx, and force verify SSL
-docker compose -f compose.production.yml up -d --build
+if ! docker compose -f compose.production.yml up -d --build; then
+    echo -e "${RED}❌ Deployment failed: Docker Compose could not start all services.${NC}"
+    echo -e "Check: docker compose -f compose.production.yml ps -a, docker logs supporthub_ssl_init"
+    exit 1
+fi
 
 # Run database migrations (creates/updates schema on first run and after updates)
 echo -e "${GREEN}Running database migrations...${NC}"
@@ -68,15 +72,72 @@ LOG_PID=$!
 EXIT_CODE=$(docker wait supporthub_ssl_init)
 kill $LOG_PID 2>/dev/null
 
-if [ "$EXIT_CODE" == "0" ]; then
-    echo -e "\n${GREEN}SSL Initialization successful.${NC}"
-    echo -e "${GREEN}Reloading Nginx to apply certificates...${NC}"
-    # restart (not reload) so it also recovers if nginx is not currently running
-    docker compose -f compose.production.yml restart nginx
-    echo -e "${GREEN}✅ Deployment Complete!${NC}"
-    echo -e "${GREEN}Your site should be live at https://$DOMAIN${NC}"
-else
+if [ "$EXIT_CODE" != "0" ]; then
     echo -e "\n${RED}SSL Initialization failed (Exit code: $EXIT_CODE).${NC}"
     echo -e "Check logs with: docker logs supporthub_ssl_init"
+    exit 1
 fi
 
+echo -e "\n${GREEN}SSL Initialization finished.${NC}"
+echo -e "${GREEN}Restarting Nginx to apply certificates...${NC}"
+# restart (not reload) so it also recovers if nginx is not currently running
+if ! docker compose -f compose.production.yml restart nginx; then
+    echo -e "${RED}❌ Deployment failed: could not restart Nginx.${NC}"
+    exit 1
+fi
+
+# Verify Nginx is really serving. Require several successes in a row so that a
+# container stuck in a restart loop is not mistaken for a running one.
+echo -e "${GREEN}Verifying Nginx...${NC}"
+OK_COUNT=0
+for _ in $(seq 1 30); do
+    sleep 2
+    if docker compose -f compose.production.yml exec -T nginx \
+        wget -q --spider http://127.0.0.1/nginx-health >/dev/null 2>&1; then
+        OK_COUNT=$((OK_COUNT + 1))
+        [ "$OK_COUNT" -ge 3 ] && break
+    else
+        OK_COUNT=0
+    fi
+done
+
+if [ "$OK_COUNT" -lt 3 ]; then
+    echo -e "${RED}❌ Deployment failed: Nginx is not running. Last log lines:${NC}"
+    docker logs --tail 20 supporthub_nginx
+    exit 1
+fi
+echo -e "${GREEN}✅ Nginx is running.${NC}"
+
+# Verify the certificate. init-ssl.sh exits 0 even when it falls back to a
+# self-signed certificate, so its exit code alone proves nothing.
+CERT_INFO=$(docker compose -f compose.production.yml exec -T nginx \
+    openssl x509 -in /etc/nginx/ssl/cert.pem -noout -issuer -subject -enddate 2>/dev/null | tr -d '\r')
+CERT_ISSUER=$(echo "$CERT_INFO" | sed -n 's/^issuer= *//p')
+CERT_SUBJECT=$(echo "$CERT_INFO" | sed -n 's/^subject= *//p')
+CERT_EXPIRY=$(echo "$CERT_INFO" | sed -n 's/^notAfter=//p')
+
+if [ -z "$CERT_ISSUER" ]; then
+    echo -e "${RED}❌ Deployment failed: could not read the SSL certificate.${NC}"
+    exit 1
+fi
+
+if ! docker compose -f compose.production.yml exec -T nginx \
+    openssl x509 -in /etc/nginx/ssl/cert.pem -noout -checkend 0 >/dev/null 2>&1; then
+    echo -e "${RED}❌ Deployment failed: the SSL certificate expired on $CERT_EXPIRY.${NC}"
+    exit 1
+fi
+
+if [ "$CERT_ISSUER" == "$CERT_SUBJECT" ]; then
+    # Self-signed is expected only when testing on localhost or an IP address
+    if [ "$DOMAIN" == "localhost" ] || [[ "$DOMAIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo -e "${YELLOW}⚠️  Using a self-signed certificate (testing mode).${NC}"
+    else
+        echo -e "${RED}❌ Deployment incomplete: the site is up, but with a self-signed certificate.${NC}"
+        echo -e "Let's Encrypt did not issue one. Check logs with: docker logs supporthub_ssl_init"
+        exit 1
+    fi
+fi
+
+echo -e "${GREEN}Certificate valid until: $CERT_EXPIRY${NC}"
+echo -e "${GREEN}✅ Deployment Complete!${NC}"
+echo -e "${GREEN}Your site should be live at https://$DOMAIN${NC}"

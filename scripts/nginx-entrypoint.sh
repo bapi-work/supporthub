@@ -65,6 +65,65 @@ for file in /etc/nginx/conf.d/*.conf; do
     fi
 done
 
+# Keep nginx's copy of the certificate in step with Let's Encrypt.
+# The certbot container renews into /etc/letsencrypt, but nginx serves the copy
+# in /etc/nginx/ssl, so a renewal only takes effect once it is copied over and
+# nginx is reloaded.
+LIVE_DIR="/etc/letsencrypt/live/$DOMAIN"
+SSL_DIR="/etc/nginx/ssl"
+CERT_SYNC_INTERVAL="${CERT_SYNC_INTERVAL:-3600}"
+
+# Succeeds only if a new certificate was installed
+sync_certs() {
+    [ -f "$LIVE_DIR/fullchain.pem" ] && [ -f "$LIVE_DIR/privkey.pem" ] || return 1
+
+    if cmp -s "$LIVE_DIR/fullchain.pem" "$SSL_DIR/cert.pem" &&
+       cmp -s "$LIVE_DIR/privkey.pem" "$SSL_DIR/key.pem"; then
+        return 1
+    fi
+
+    cp "$LIVE_DIR/fullchain.pem" "$SSL_DIR/cert.pem.new" || return 1
+    (umask 077 && cp "$LIVE_DIR/privkey.pem" "$SSL_DIR/key.pem.new") || return 1
+
+    # Never install an expired certificate, or a key that does not match it
+    # (for example if certbot is part-way through writing the new pair)
+    cert_pub=$(openssl x509 -in "$SSL_DIR/cert.pem.new" -noout -pubkey 2>/dev/null) || cert_pub=""
+    key_pub=$(openssl pkey -in "$SSL_DIR/key.pem.new" -pubout 2>/dev/null) || key_pub=""
+    if [ -z "$cert_pub" ] || [ "$cert_pub" != "$key_pub" ] ||
+       ! openssl x509 -in "$SSL_DIR/cert.pem.new" -noout -checkend 0 >/dev/null 2>&1; then
+        echo "⚠️  Ignoring unusable Let's Encrypt certificate in $LIVE_DIR" >&2
+        rm -f "$SSL_DIR/cert.pem.new" "$SSL_DIR/key.pem.new"
+        return 1
+    fi
+
+    mv "$SSL_DIR/key.pem.new" "$SSL_DIR/key.pem" &&
+        mv "$SSL_DIR/cert.pem.new" "$SSL_DIR/cert.pem"
+}
+
+watch_certs() {
+    reload_pending=0
+    while :; do
+        sleep "$CERT_SYNC_INTERVAL"
+        if sync_certs; then
+            echo "🔐 New Let's Encrypt certificate installed"
+            reload_pending=1
+        fi
+        if [ "$reload_pending" = 1 ]; then
+            if nginx -t -q && nginx -s reload; then
+                echo "✅ Nginx reloaded with the new certificate"
+                reload_pending=0
+            else
+                echo "❌ Nginx reload failed, will retry" >&2
+            fi
+        fi
+    done
+}
+
+if sync_certs; then
+    echo "🔐 Let's Encrypt certificate installed"
+fi
+watch_certs &
+
 echo "🚀 Starting Nginx..."
 
 # Start Nginx with the original entrypoint

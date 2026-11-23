@@ -1,358 +1,318 @@
-# Production Deployment Guide
+# SupportHub — Production Deployment Guide
 
-This guide covers deploying SupportHub on a Linux server using Docker and Docker Compose.
+## Choose Your Setup
 
----
+| | **With SSL (Let's Encrypt)** | **Without SSL (Behind Proxy)** |
+|---|---|---|
+| **Internal DB** (Docker) | [Path A](#path-a--ssl--internal-db) | [Path C](#path-c--no-ssl--internal-db) |
+| **Managed DB** (RDS / Azure / DO) | [Path B](#path-b--ssl--managed-db) | [Path D](#path-d--no-ssl--managed-db) |
 
-## ⚠️ Database Compatibility Notice
-
-> **SupportHub requires PostgreSQL 14+.**  
-> **MySQL and MariaDB are NOT supported.** The application uses Drizzle ORM (PostgreSQL dialect), the `pg` driver, and `connect-pg-simple` — none of which are compatible with MySQL/MariaDB.
->
-> For full database setup details, see [database.md](database.md).
+- **With SSL** — Nginx + Let's Encrypt managed automatically. Use when the server is directly internet-facing.
+- **Without SSL** — App runs on port `5000`. Use when terminating SSL at a reverse proxy (Nginx Proxy Manager, Traefik, Cloudflare Tunnel, AWS ALB).
+- **Internal DB** — PostgreSQL runs as a Docker container alongside the app. Zero extra cost, simplest setup.
+- **Managed DB** — External PostgreSQL (AWS RDS, Azure Database, DigitalOcean Managed DB). Recommended for high availability and automated backups.
 
 ---
 
 ## Prerequisites
 
-| Requirement | Details |
-|---|---|
-| **Server OS** | Ubuntu 20.04 / 22.04 LTS (recommended). Minimum **2 vCPU, 2 GB RAM** |
-| **Docker Engine** | v24+ (`docker --version`) |
-| **Docker Compose** | V2 plugin — use `docker compose` (not `docker-compose`) |
-| **Domain** | A domain name with DNS A-record pointing to your server |
-| **Ports** | 80 and 443 open in firewall |
+- **Server**: Ubuntu 20.04/22.04 LTS — minimum 2 vCPU, 4 GB RAM
+- **Software**: Docker Engine + Docker Compose V2, Git
+- **Domain**: A domain name with DNS pointing to your server IP (required for SSL paths)
+
+```bash
+# Install Docker (one-liner)
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker $USER && newgrp docker
+```
 
 ---
 
-## 1. Clone & Configure
+## Step 1 — Clone the Repository
 
 ```bash
-# Clone the repository
 git clone <repository_url> supporthub
 cd supporthub
-
-# Copy and edit environment file
 cp .env.example .env
-nano .env
 ```
 
-**Minimum required `.env` values:**
-```bash
-# Application
+---
+
+## Step 2 — Configure `.env`
+
+Open `.env` and fill in the required values. The file is split into sections:
+
+### 2a — Application (always required)
+
+```env
 NODE_ENV=production
-DOMAIN=your-domain.com          # Used for SSL certificate
-EMAIL=admin@your-domain.com     # Let's Encrypt notifications
-
-# Security — CRITICAL: generate a strong secret
-SESSION_SECRET=$(openssl rand -base64 48)
-
-# Database — see options below
-DATABASE_URL=postgresql://supporthub:password@db:5432/supporthub
+DOMAIN=yourdomain.com          # Your domain (used by Nginx for SSL)
+EMAIL=you@yourdomain.com       # Let's Encrypt expiry notifications
+SESSION_SECRET=                # Generate: openssl rand -base64 48
+TRUST_PROXY=1                  # Required when behind Nginx or any proxy
 ```
 
----
+### 2b — Database (choose ONE option)
 
-## 2. Database Options
+**Option 1 — Internal Docker PostgreSQL (default)**
 
-### Option A: Internal PostgreSQL (Default — simplest)
-
-The default `compose.production.yml` includes a PostgreSQL 15 container.
-
-- ✅ No extra setup needed
-- ✅ Zero cost
-- ⚠️ Backups are manual (see section 5)
-- ❌ Not suitable for multi-server or high-availability setups
-
-Leave `DATABASE_URL` pointing to the internal container:
-```bash
-DATABASE_URL=postgresql://supporthub:${POSTGRES_PASSWORD}@db:5432/supporthub
-```
-
-Set a strong database password:
-```bash
-POSTGRES_PASSWORD=your_strong_db_password
+```env
 POSTGRES_USER=supporthub
+POSTGRES_PASSWORD=             # Generate: openssl rand -base64 32
 POSTGRES_DB=supporthub
+DATABASE_URL=postgresql://supporthub:<same-password>@db:5432/supporthub
+```
+
+> The `DATABASE_URL` host must be `db` (the Docker service name) when using internal DB.
+
+**Option 2 — Managed PostgreSQL (AWS RDS / Azure / DigitalOcean)**
+
+```env
+# Leave POSTGRES_* vars empty or remove them
+DATABASE_URL=postgresql://<user>:<password>@<host>:<port>/<dbname>?sslmode=require
+```
+
+Connection string examples:
+
+```env
+# AWS RDS
+DATABASE_URL=postgresql://postgres:password@mydb.us-east-1.rds.amazonaws.com:5432/supporthub?sslmode=require
+
+# Azure Database for PostgreSQL (Flexible Server)
+DATABASE_URL=postgresql://adminuser:password@myserver.postgres.database.azure.com:5432/supporthub?sslmode=require
+
+# DigitalOcean Managed Database
+DATABASE_URL=postgresql://doadmin:password@db-postgresql-nyc3-12345.a.db.ondigitalocean.com:25060/supporthub?sslmode=require
+```
+
+### 2c — Storage (choose ONE option, LOCAL is default)
+
+```env
+STORAGE_PROVIDER=LOCAL         # Options: LOCAL, S3, AZURE
+
+# AWS S3
+# STORAGE_PROVIDER=S3
+# AWS_ACCESS_KEY_ID=your_key
+# AWS_SECRET_ACCESS_KEY=your_secret
+# AWS_REGION=us-east-1
+# AWS_BUCKET=your-bucket
+
+# DigitalOcean Spaces (S3-compatible)
+# STORAGE_PROVIDER=S3
+# AWS_ACCESS_KEY_ID=your_spaces_key
+# AWS_SECRET_ACCESS_KEY=your_spaces_secret
+# AWS_REGION=nyc3
+# AWS_BUCKET=your-space-name
+# S3_ENDPOINT=https://nyc3.digitaloceanspaces.com
+
+# Azure Blob Storage
+# STORAGE_PROVIDER=AZURE
+# AZURE_STORAGE_ACCOUNT_NAME=mystorageaccount
+# AZURE_STORAGE_ACCOUNT_KEY=your_long_key
+# AZURE_STORAGE_CONTAINER_NAME=supporthub-uploads
 ```
 
 ---
 
-### Option B: External Managed PostgreSQL (Recommended for Production)
+## Path A — SSL + Internal DB
 
-Use any of the following managed services. After provisioning, update `.env` and modify `compose.production.yml`.
+Uses `compose.production.yml`. Nginx handles HTTPS with auto-renewing Let's Encrypt certificates. PostgreSQL runs as a Docker container.
 
-**AWS RDS for PostgreSQL:**
+**`.env` checklist:**
+- `DOMAIN` set to your real domain
+- `EMAIL` set to a real email
+- `POSTGRES_PASSWORD` set
+- `DATABASE_URL` host is `db`
+- `SESSION_SECRET` set
+
 ```bash
-DATABASE_URL=postgresql://supporthub:password@your-instance.us-east-1.rds.amazonaws.com:5432/supporthub?sslmode=require
+chmod +x scripts/deploy.sh
+./scripts/deploy.sh
 ```
 
-**DigitalOcean Managed Database:**
+The script:
+1. Builds all containers
+2. Runs database migrations
+3. Initializes SSL certificate via Certbot
+4. Starts auto-renewal (every 12 hours)
+
+**App available at:** `https://yourdomain.com`
+
+---
+
+## Path B — SSL + Managed DB
+
+Same as Path A, but the PostgreSQL container is removed.
+
+**Edit `compose.production.yml`** — make these two changes:
+
+1. Delete the entire `db:` service block (lines starting with `db:` through the healthcheck)
+2. In the `app:` service, change:
+   ```yaml
+   # Remove this line:
+   depends_on:
+     db:
+       condition: service_healthy
+
+   # And replace the hardcoded DATABASE_URL with:
+   DATABASE_URL: ${DATABASE_URL}
+   ```
+
+**`.env` checklist:**
+- `DOMAIN`, `EMAIL`, `SESSION_SECRET` set
+- `DATABASE_URL` points to your managed DB with `?sslmode=require`
+- No `POSTGRES_*` vars needed
+
 ```bash
-# Port is 25060, not 5432
-DATABASE_URL=postgresql://doadmin:password@db-postgresql-nyc3-xxxxx.a.db.ondigitalocean.com:25060/supporthub?sslmode=require
+chmod +x scripts/deploy.sh
+./scripts/deploy.sh
 ```
 
-**Azure Database for PostgreSQL (Flexible Server):**
+**App available at:** `https://yourdomain.com`
+
+---
+
+## Path C — No-SSL + Internal DB
+
+Uses `compose.nossl.yml`. No Nginx, no Certbot. The app exposes port `5000` directly. Your reverse proxy (Nginx Proxy Manager, Traefik, Cloudflare Tunnel, etc.) handles SSL termination upstream.
+
+**`.env` checklist:**
+- `POSTGRES_PASSWORD` set
+- `DATABASE_URL` host is `db`
+- `SESSION_SECRET` set
+- `DOMAIN` / `EMAIL` not required
+
 ```bash
-DATABASE_URL=postgresql://supporthub:password@your-server.postgres.database.azure.com:5432/supporthub?sslmode=require
+chmod +x scripts/deploy-nossl.sh
+./scripts/deploy-nossl.sh
 ```
 
-**Self-hosted PostgreSQL on separate server:**
-```bash
-DATABASE_URL=postgresql://supporthub:password@your.db.server.ip:5432/supporthub?sslmode=require
-```
+**Point your proxy to:** `http://<server-ip>:5000`
 
-**Update `compose.production.yml` to remove the internal DB:**
+### Nginx Proxy Manager
+
+1. Add a Proxy Host
+2. **Domain Names**: `yourdomain.com`
+3. **Scheme**: `http` | **Forward Hostname/IP**: `<server-ip>` | **Forward Port**: `5000`
+4. Enable SSL → Request Let's Encrypt certificate
+
+### Traefik (docker-compose label example)
+
+Add these labels to the `app` service in `compose.nossl.yml`:
+
 ```yaml
-# Remove the entire 'db' service block and these lines under 'app':
-# depends_on:
-#   db:
-#     condition: service_healthy
-```
-
-> 📖 Full managed database setup instructions: [database.md](database.md)
-
----
-
-## 3. Deployment Commands
-
-### Option A: SSL Production (Recommended — requires a real domain)
-Sets up Nginx with automatic Let's Encrypt HTTPS certificates:
-
-```bash
-docker compose -f compose.production.yml up -d --build
-```
-
-Access: `https://your-domain.com`
-
----
-
-### Option B: Behind Load Balancer / Reverse Proxy (No SSL termination)
-Use when SSL is handled upstream (AWS ALB, Cloudflare, Azure Front Door, etc.):
-
-```bash
-docker compose -f compose.nossl.yml up -d --build
-```
-
-Access: `http://your-server-ip:5000`
-
----
-
-### Option C: Local Development
-```bash
-docker compose -f compose.dev.yml up -d --build
-```
-
-Access: `https://localhost` (accept the self-signed certificate warning)
-
----
-
-## 4. First Run
-
-After deployment:
-
-1. **Access the admin portal:** `https://your-domain.com/admin`
-2. **Default credentials:**
-   - Admin: `admin@supporthub.com` / `admin123`
-   - Agent: `agent@supporthub.com` / `agent123`
-3. **Change passwords immediately** — Admin Settings → Admin Users
-
----
-
-## 5. File Storage Options
-
-By default, uploads are stored in a local Docker volume (`app_uploads`). For multi-server or cloud deployments, use object storage.
-
-**AWS S3:**
-```bash
-STORAGE_PROVIDER=S3
-AWS_ACCESS_KEY_ID=your_access_key
-AWS_SECRET_ACCESS_KEY=your_secret_key
-AWS_REGION=us-east-1
-AWS_BUCKET=supporthub-uploads
-```
-
-**DigitalOcean Spaces (S3-compatible):**
-```bash
-STORAGE_PROVIDER=S3
-AWS_ACCESS_KEY_ID=your_spaces_key
-AWS_SECRET_ACCESS_KEY=your_spaces_secret
-AWS_REGION=nyc3
-AWS_BUCKET=my-space-name
-S3_ENDPOINT=https://nyc3.digitaloceanspaces.com
-```
-
-**Azure Blob Storage:**
-```bash
-STORAGE_PROVIDER=AZURE
-AZURE_STORAGE_ACCOUNT_NAME=mystorageaccount
-AZURE_STORAGE_ACCOUNT_KEY=your_long_access_key
-AZURE_STORAGE_CONTAINER_NAME=supporthub-uploads
+labels:
+  - "traefik.enable=true"
+  - "traefik.http.routers.supporthub.rule=Host(`yourdomain.com`)"
+  - "traefik.http.routers.supporthub.entrypoints=websecure"
+  - "traefik.http.routers.supporthub.tls.certresolver=letsencrypt"
+  - "traefik.http.services.supporthub.loadbalancer.server.port=5000"
 ```
 
 ---
 
-## 6. Backups
+## Path D — No-SSL + Managed DB
 
-### Database
+Same as Path C, but the internal PostgreSQL container is removed.
 
-**Internal Docker database:**
+**Edit `compose.nossl.yml`** — make the same two changes as Path B:
+
+1. Delete the `db:` service block
+2. In the `app:` service, remove `depends_on` and change `DATABASE_URL` to `${DATABASE_URL}`
+
+**`.env` checklist:**
+- `DATABASE_URL` points to your managed DB with `?sslmode=require`
+- `SESSION_SECRET` set
+- No `POSTGRES_*` vars needed
+
 ```bash
-# Backup
-docker compose -f compose.production.yml exec db \
-    pg_dump -U supporthub supporthub > "backup_$(date +%F_%H%M%S).sql"
-
-# Restore
-docker compose -f compose.production.yml exec -T db \
-    psql -U supporthub supporthub < backup_2024-01-01.sql
+chmod +x scripts/deploy-nossl.sh
+./scripts/deploy-nossl.sh
 ```
 
-**External managed database:**
-```bash
-# Requires psql client installed on your server
-pg_dump "$DATABASE_URL" | gzip > "backup_$(date +%F).sql.gz"
-```
-
-**Schedule with cron (daily at 02:00):**
-```bash
-0 2 * * * cd /path/to/supporthub && docker compose -f compose.production.yml exec -T db pg_dump -U supporthub supporthub | gzip > /backups/db_$(date +\%F).sql.gz
-```
-
-### File Uploads (local storage)
-```bash
-# Backup the Docker volume
-docker run --rm \
-    -v supporthub_app_uploads:/data \
-    -v /backups:/backup \
-    alpine tar czf /backup/uploads_$(date +%F).tar.gz -C /data .
-```
+**Point your proxy to:** `http://<server-ip>:5000`
 
 ---
 
-## 7. Updates
+## Step 3 — First Login
 
-```bash
-cd /path/to/supporthub
+| Portal | URL | Default Email | Default Password |
+|--------|-----|--------------|-----------------|
+| **Admin** | `/admin` | `admin@supporthub.com` | `admin123` |
+| **Agent** | `/` | `agent@example.com` | `password123` |
 
-# Pull latest code
-git pull
-
-# Rebuild and restart (zero-downtime for DB changes)
-docker compose -f compose.production.yml up -d --build
-
-# Schema migrations run automatically on startup
-# To run manually:
-docker compose -f compose.production.yml exec app npm run db:push
-```
+> ⚠️ **Change these passwords immediately** from the Admin panel after first login.
 
 ---
 
-## 8. Security Hardening
+## Maintenance
+
+### View logs
 
 ```bash
-# Protect .env file
-chmod 600 .env
-
-# Verify .env is not in git
-grep ".env" .gitignore   # Should show: .env
-
-# Check for exposed ports (only 80 and 443 should be public)
-ss -tlnp
-
-# Firewall (UFW)
-sudo ufw allow 22/tcp    # SSH
-sudo ufw allow 80/tcp    # HTTP (for Let's Encrypt)
-sudo ufw allow 443/tcp   # HTTPS
-sudo ufw enable
-```
-
----
-
-## 9. Health Checks & Monitoring
-
-```bash
-# Application health
-curl https://your-domain.com/api/health
-# Expected: {"status":"ok","timestamp":"..."}
-
-# Container status
-docker compose -f compose.production.yml ps
-
-# Logs
+# SSL deployment
 docker compose -f compose.production.yml logs -f app
-docker compose -f compose.production.yml logs -f nginx
 
-# Restart a service
+# No-SSL deployment
+docker compose -f compose.nossl.yml logs -f app
+```
+
+### Update the application
+
+```bash
+git pull
+./scripts/deploy.sh          # SSL
+# or
+./scripts/deploy-nossl.sh    # No-SSL
+```
+
+The deploy scripts rebuild containers and re-run migrations automatically.
+
+### Backup database (internal DB only)
+
+```bash
+# Create backup
+docker compose exec db pg_dump -U supporthub supporthub > backup_$(date +%F).sql
+
+# Restore backup
+docker compose exec -T db psql -U supporthub supporthub < backup_YYYY-MM-DD.sql
+```
+
+For managed databases, use your provider's native backup tools (RDS automated backups, DO scheduled backups, Azure backup).
+
+### Run migrations manually
+
+```bash
+docker compose -f compose.production.yml exec app npm run db:push
+# or
+docker compose -f compose.nossl.yml exec app npm run db:push
+```
+
+### Restart a service
+
+```bash
 docker compose -f compose.production.yml restart app
 ```
 
 ---
 
-## 10. Full `.env` Reference
+## Environment Variable Reference
 
-```bash
-# ─── Core ─────────────────────────────────────────────
-NODE_ENV=production
-PORT=5000
-DOMAIN=your-domain.com
-EMAIL=admin@your-domain.com
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `NODE_ENV` | Yes | Must be `production` |
+| `DOMAIN` | SSL only | Domain name (e.g. `mysite.com`) |
+| `EMAIL` | SSL only | Email for Let's Encrypt notifications |
+| `SESSION_SECRET` | Yes | Random secret (min 32 chars) |
+| `TRUST_PROXY` | Yes | Set to `1` when behind any proxy/Nginx |
+| `DATABASE_URL` | Yes | Full PostgreSQL connection string |
+| `POSTGRES_USER` | Internal DB | DB username (default: `supporthub`) |
+| `POSTGRES_PASSWORD` | Internal DB | DB password — **must be set** |
+| `POSTGRES_DB` | Internal DB | DB name (default: `supporthub`) |
+| `STORAGE_PROVIDER` | No | `LOCAL` (default), `S3`, or `AZURE` |
+| `SENDGRID_API_KEY` | No | For email notifications via SendGrid |
+| `SMTP_HOST` | No | For email via SMTP |
+| `TWILIO_ACCOUNT_SID` | No | For SMS via Twilio |
+| `WHATSAPP_ACCESS_TOKEN` | No | For WhatsApp channel |
 
-# ─── Security ─────────────────────────────────────────
-# Generate: openssl rand -base64 48
-SESSION_SECRET=your_very_long_random_secret
-TRUST_PROXY=1
-
-# ─── Database (PostgreSQL only) ────────────────────────
-DATABASE_URL=postgresql://user:password@host:5432/supporthub?sslmode=require
-
-# Internal DB only — remove if using external DB
-POSTGRES_DB=supporthub
-POSTGRES_USER=supporthub
-POSTGRES_PASSWORD=your_db_password
-
-# ─── Email ────────────────────────────────────────────
-# Option 1: SendGrid
-SENDGRID_API_KEY=SG.xxx
-VERIFIED_SENDER_EMAIL=noreply@your-domain.com
-
-# Option 2: SMTP
-SMTP_HOST=smtp.yourprovider.com
-SMTP_PORT=587
-SMTP_USER=
-SMTP_PASS=
-
-# ─── SMS (Optional) ───────────────────────────────────
-TWILIO_ACCOUNT_SID=
-TWILIO_AUTH_TOKEN=
-TWILIO_PHONE_NUMBER=
-
-# ─── File Storage ─────────────────────────────────────
-STORAGE_PROVIDER=LOCAL   # LOCAL | S3 | AZURE
-
-# AWS S3 / DigitalOcean Spaces
-AWS_ACCESS_KEY_ID=
-AWS_SECRET_ACCESS_KEY=
-AWS_REGION=us-east-1
-AWS_BUCKET=
-S3_ENDPOINT=             # Only for DO Spaces / MinIO
-
-# Azure Blob Storage
-AZURE_STORAGE_ACCOUNT_NAME=
-AZURE_STORAGE_ACCOUNT_KEY=
-AZURE_STORAGE_CONTAINER_NAME=supporthub-uploads
-```
-
----
-
-## Production Checklist
-
-- [ ] `SESSION_SECRET` set to a strong random value (`openssl rand -base64 48`)
-- [ ] `NODE_ENV=production`
-- [ ] `DATABASE_URL` with `?sslmode=require` for external DB
-- [ ] Default admin/agent passwords changed after first login
-- [ ] `.env` has permissions `600` and is excluded from git
-- [ ] Firewall allows only 22, 80, 443
-- [ ] SSL certificate active (HTTPS working)
-- [ ] Automated database backups configured
-- [ ] Email service configured (SendGrid or SMTP)
+For the full list see `.env.example`.
